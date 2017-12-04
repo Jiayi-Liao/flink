@@ -133,6 +133,7 @@ under the License.
 		-->
 		<minikdc.version>2.7.2</minikdc.version>
 		<generated.docs.dir>./docs/_includes/generated</generated.docs.dir>
+		<redis.version>2.9.0</redis.version>
 	</properties>
 
 	<dependencies>
