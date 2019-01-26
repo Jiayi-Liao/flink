@@ -27,16 +27,14 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.ListSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
-import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.cep.EventComparator;
 import org.apache.flink.cep.nfa.NFA;
-import org.apache.flink.cep.nfa.NFA.MigratedNFA;
 import org.apache.flink.cep.nfa.NFAState;
 import org.apache.flink.cep.nfa.NFAStateSerializer;
+import org.apache.flink.cep.nfa.UserEvent;
 import org.apache.flink.cep.nfa.aftermatch.AfterMatchSkipStrategy;
 import org.apache.flink.cep.nfa.compiler.NFACompiler;
 import org.apache.flink.cep.nfa.sharedbuffer.SharedBuffer;
-import org.apache.flink.runtime.state.KeyedStateFunction;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.VoidNamespaceSerializer;
@@ -50,12 +48,9 @@ import org.apache.flink.util.OutputTag;
 import org.apache.flink.util.Preconditions;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.PriorityQueue;
-import java.util.stream.Stream;
 
 /**
  * Abstract CEP pattern operator for a keyed input stream. For each key, the operator creates
@@ -68,13 +63,11 @@ import java.util.stream.Stream;
  * @param <KEY> Type of the key on which the input stream is keyed
  * @param <OUT> Type of the output elements
  */
-public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Function>
+public abstract class AbstractKeyedCEPPatternOperator<IN extends UserEvent, KEY, OUT, F extends Function>
 		extends AbstractUdfStreamOperator<OUT, F>
 		implements OneInputStreamOperator<IN, OUT>, Triggerable<KEY, VoidNamespace> {
 
 	private static final long serialVersionUID = -4166778210774160757L;
-
-	private final boolean isProcessingTime;
 
 	private final TypeSerializer<IN> inputSerializer;
 
@@ -92,14 +85,6 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 	private transient InternalTimerService<VoidNamespace> timerService;
 
 	private transient NFA<IN> nfa;
-
-	/**
-	 * The last seen watermark. This will be used to
-	 * decide if an incoming element is late or not.
-	 */
-	private long lastWatermark;
-
-	private final EventComparator<IN> comparator;
 
 	/**
 	 * {@link OutputTag} to use for late arriving events. Elements with timestamp smaller than
@@ -120,9 +105,7 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 		super(function);
 
 		this.inputSerializer = Preconditions.checkNotNull(inputSerializer);
-		this.isProcessingTime = Preconditions.checkNotNull(isProcessingTime);
 		this.nfaFactory = Preconditions.checkNotNull(nfaFactory);
-		this.comparator = comparator;
 		this.lateDataOutputTag = lateDataOutputTag;
 
 		if (afterMatchSkipStrategy == null) {
@@ -149,29 +132,6 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 						EVENT_QUEUE_STATE_NAME,
 						LongSerializer.INSTANCE,
 						new ListSerializer<>(inputSerializer)));
-
-		migrateOldState();
-	}
-
-	private void migrateOldState() throws Exception {
-		getKeyedStateBackend().applyToAllKeys(
-			VoidNamespace.INSTANCE,
-			VoidNamespaceSerializer.INSTANCE,
-			new ValueStateDescriptor<>(
-				"nfaOperatorStateName",
-				new NFA.NFASerializer<>(inputSerializer)
-			),
-			new KeyedStateFunction<Object, ValueState<MigratedNFA<IN>>>() {
-				@Override
-				public void process(Object key, ValueState<MigratedNFA<IN>> state) throws Exception {
-					MigratedNFA<IN> oldState = state.value();
-					computationStates.update(new NFAState(oldState.getComputationStates()));
-					org.apache.flink.cep.nfa.SharedBuffer<IN> sharedBuffer = oldState.getSharedBuffer();
-					partialMatches.init(sharedBuffer.getEventsBuffer(), sharedBuffer.getPages());
-					state.clear();
-				}
-			}
-		);
 	}
 
 	@Override
@@ -188,162 +148,23 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 
 	@Override
 	public void processElement(StreamRecord<IN> element) throws Exception {
-		if (isProcessingTime) {
-			if (comparator == null) {
-				// there can be no out of order elements in processing time
-				NFAState nfaState = getNFAState();
-				long timestamp = getProcessingTimeService().getCurrentProcessingTime();
-				advanceTime(nfaState, timestamp);
-				processEvent(nfaState, element.getValue(), timestamp);
-				updateNFA(nfaState);
-			} else {
-				long currentTime = timerService.currentProcessingTime();
-				bufferEvent(element.getValue(), currentTime);
+		// there can be no out of order elements in processing time
+		NFAState nfaState = getNFAState();
+		long timestamp = getProcessingTimeService().getCurrentProcessingTime();
 
-				// register a timer for the next millisecond to sort and emit buffered data
-				timerService.registerProcessingTimeTimer(VoidNamespace.INSTANCE, currentTime + 1);
-			}
-
-		} else {
-
-			long timestamp = element.getTimestamp();
-			IN value = element.getValue();
-
-			// In event-time processing we assume correctness of the watermark.
-			// Events with timestamp smaller than or equal with the last seen watermark are considered late.
-			// Late events are put in a dedicated side output, if the user has specified one.
-
-			if (timestamp > lastWatermark) {
-
-				// we have an event with a valid timestamp, so
-				// we buffer it until we receive the proper watermark.
-
-				saveRegisterWatermarkTimer();
-
-				bufferEvent(value, timestamp);
-
-			} else if (lateDataOutputTag != null) {
-				output.collect(lateDataOutputTag, element);
-			}
-		}
-	}
-
-	/**
-	 * Registers a timer for {@code current watermark + 1}, this means that we get triggered
-	 * whenever the watermark advances, which is what we want for working off the queue of
-	 * buffered elements.
-	 */
-	private void saveRegisterWatermarkTimer() {
-		long currentWatermark = timerService.currentWatermark();
-		// protect against overflow
-		if (currentWatermark + 1 > currentWatermark) {
-			timerService.registerEventTimeTimer(VoidNamespace.INSTANCE, currentWatermark + 1);
-		}
-	}
-
-	private void bufferEvent(IN event, long currentTime) throws Exception {
-		List<IN> elementsForTimestamp =  elementQueueState.get(currentTime);
-		if (elementsForTimestamp == null) {
-			elementsForTimestamp = new ArrayList<>();
-		}
-
-		if (getExecutionConfig().isObjectReuseEnabled()) {
-			// copy the StreamRecord so that it cannot be changed
-			elementsForTimestamp.add(inputSerializer.copy(event));
-		} else {
-			elementsForTimestamp.add(event);
-		}
-		elementQueueState.put(currentTime, elementsForTimestamp);
+		// advanceTime(nfaState, timestamp);  We don't need it for now
+		processEvent(nfaState, element.getValue(), timestamp);
+		updateNFA(nfaState);
 	}
 
 	@Override
-	public void onEventTime(InternalTimer<KEY, VoidNamespace> timer) throws Exception {
-
-		// 1) get the queue of pending elements for the key and the corresponding NFA,
-		// 2) process the pending elements in event time order and custom comparator if exists
-		//		by feeding them in the NFA
-		// 3) advance the time to the current watermark, so that expired patterns are discarded.
-		// 4) update the stored state for the key, by only storing the new NFA and MapState iff they
-		//		have state to be used later.
-		// 5) update the last seen watermark.
-
-		// STEP 1
-		PriorityQueue<Long> sortedTimestamps = getSortedTimestamps();
-		NFAState nfaState = getNFAState();
-
-		// STEP 2
-		while (!sortedTimestamps.isEmpty() && sortedTimestamps.peek() <= timerService.currentWatermark()) {
-			long timestamp = sortedTimestamps.poll();
-			advanceTime(nfaState, timestamp);
-			try (Stream<IN> elements = sort(elementQueueState.get(timestamp))) {
-				elements.forEachOrdered(
-					event -> {
-						try {
-							processEvent(nfaState, event, timestamp);
-						} catch (Exception e) {
-							throw new RuntimeException(e);
-						}
-					}
-				);
-			}
-			elementQueueState.remove(timestamp);
-		}
-
-		// STEP 3
-		advanceTime(nfaState, timerService.currentWatermark());
-
-		// STEP 4
-		updateNFA(nfaState);
-
-		if (!sortedTimestamps.isEmpty() || !partialMatches.isEmpty()) {
-			saveRegisterWatermarkTimer();
-		}
-
-		// STEP 5
-		updateLastSeenWatermark(timerService.currentWatermark());
+	public void onEventTime(InternalTimer<KEY, VoidNamespace> timer) {
+		// do not support event time
 	}
 
 	@Override
 	public void onProcessingTime(InternalTimer<KEY, VoidNamespace> timer) throws Exception {
-		// 1) get the queue of pending elements for the key and the corresponding NFA,
-		// 2) process the pending elements in process time order and custom comparator if exists
-		//		by feeding them in the NFA
-		// 3) update the stored state for the key, by only storing the new NFA and MapState iff they
-		//		have state to be used later.
-
-		// STEP 1
-		PriorityQueue<Long> sortedTimestamps = getSortedTimestamps();
-		NFAState nfa = getNFAState();
-
-		// STEP 2
-		while (!sortedTimestamps.isEmpty()) {
-			long timestamp = sortedTimestamps.poll();
-			advanceTime(nfa, timestamp);
-			try (Stream<IN> elements = sort(elementQueueState.get(timestamp))) {
-				elements.forEachOrdered(
-					event -> {
-						try {
-							processEvent(nfa, event, timestamp);
-						} catch (Exception e) {
-							throw new RuntimeException(e);
-						}
-					}
-				);
-			}
-			elementQueueState.remove(timestamp);
-		}
-
-		// STEP 3
-		updateNFA(nfa);
-	}
-
-	private Stream<IN> sort(Collection<IN> elements) {
-		Stream<IN> stream = elements.stream();
-		return (comparator == null) ? stream : stream.sorted(comparator);
-	}
-
-	private void updateLastSeenWatermark(long timestamp) {
-		this.lastWatermark = timestamp;
+		// do not support processing time timer
 	}
 
 	private NFAState getNFAState() throws IOException {
@@ -356,14 +177,6 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 			nfaState.resetStateChanged();
 			computationStates.update(nfaState);
 		}
-	}
-
-	private PriorityQueue<Long> getSortedTimestamps() throws Exception {
-		PriorityQueue<Long> sortedTimestamps = new PriorityQueue<>();
-		for (Long timestamp : elementQueueState.keys()) {
-			sortedTimestamps.offer(timestamp);
-		}
-		return sortedTimestamps;
 	}
 
 	/**
@@ -380,22 +193,7 @@ public abstract class AbstractKeyedCEPPatternOperator<IN, KEY, OUT, F extends Fu
 		processMatchedSequences(patterns, timestamp);
 	}
 
-	/**
-	 * Advances the time for the given NFA to the given timestamp. This means that no more events with timestamp
-	 * <b>lower</b> than the given timestamp should be passed to the nfa, This can lead to pruning and timeouts.
-	 */
-	private void advanceTime(NFAState nfaState, long timestamp) throws Exception {
-		Collection<Tuple2<Map<String, List<IN>>, Long>> timedOut =
-			nfa.advanceTime(partialMatches, nfaState, timestamp);
-		processTimedOutSequences(timedOut, timestamp);
-	}
-
 	protected abstract void processMatchedSequences(Iterable<Map<String, List<IN>>> matchingSequences, long timestamp) throws Exception;
-
-	protected void processTimedOutSequences(
-			Iterable<Tuple2<Map<String, List<IN>>, Long>> timedOutSequences,
-			long timestamp) throws Exception {
-	}
 
 	//////////////////////			Testing Methods			//////////////////////
 

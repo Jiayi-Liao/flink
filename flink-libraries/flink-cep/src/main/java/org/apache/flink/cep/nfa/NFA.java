@@ -79,7 +79,7 @@ import static org.apache.flink.cep.nfa.MigrationUtils.deserializeComputationStat
  * @see <a href="https://people.cs.umass.edu/~yanlei/publications/sase-sigmod08.pdf">
  * https://people.cs.umass.edu/~yanlei/publications/sase-sigmod08.pdf</a>
  */
-public class NFA<T> {
+public class NFA<T extends UserEvent> {
 
 	/**
 	 * A set of all the valid NFA states, as returned by the
@@ -88,25 +88,7 @@ public class NFA<T> {
 	 */
 	private final Map<String, State<T>> states;
 
-	/**
-	 * The length of a windowed pattern, as specified using the
-	 * {@link org.apache.flink.cep.pattern.Pattern#within(Time)}  Pattern.within(Time)}
-	 * method.
-	 */
-	private final long windowTime;
-
-	/**
-	 * A flag indicating if we want timed-out patterns (in case of windowed patterns)
-	 * to be emitted ({@code true}), or silently discarded ({@code false}).
-	 */
-	private final boolean handleTimeout;
-
-	public NFA(
-			final Collection<State<T>> validStates,
-			final long windowTime,
-			final boolean handleTimeout) {
-		this.windowTime = windowTime;
-		this.handleTimeout = handleTimeout;
+	public NFA(final Collection<State<T>> validStates) {
 		this.states = loadStates(validStates);
 	}
 
@@ -216,58 +198,9 @@ public class NFA<T> {
 			final T event,
 			final long timestamp,
 			final AfterMatchSkipStrategy afterMatchSkipStrategy) throws Exception {
-		try (EventWrapper eventWrapper = new EventWrapper(event, timestamp, sharedBuffer)) {
+		try (EventWrapper eventWrapper = new EventWrapper(event, timestamp, sharedBuffer, event.getUserId())) {
 			return doProcess(sharedBuffer, nfaState, eventWrapper, afterMatchSkipStrategy);
 		}
-	}
-
-	/**
-	 * Prunes states assuming there will be no events with timestamp <b>lower</b> than the given one.
-	 * It cleares the sharedBuffer and also emits all timed out partial matches.
-	 *
-	 * @param sharedBuffer the SharedBuffer object that we need to work upon while processing
-	 * @param nfaState     The NFAState object that we need to affect while processing
-	 * @param timestamp    timestamp that indicates that there will be no more events with lower timestamp
-	 * @return all timed outed partial matches
-	 * @throws Exception Thrown if the system cannot access the state.
-	 */
-	public Collection<Tuple2<Map<String, List<T>>, Long>> advanceTime(
-			final SharedBuffer<T> sharedBuffer,
-			final NFAState nfaState,
-			final long timestamp) throws Exception {
-
-		final Collection<Tuple2<Map<String, List<T>>, Long>> timeoutResult = new ArrayList<>();
-		final PriorityQueue<ComputationState> newPartialMatches = new PriorityQueue<>(NFAState.COMPUTATION_STATE_COMPARATOR);
-
-		Map<EventId, T> eventsCache = new HashMap<>();
-		for (ComputationState computationState : nfaState.getPartialMatches()) {
-			if (isStateTimedOut(computationState, timestamp)) {
-
-				if (handleTimeout) {
-					// extract the timed out event pattern
-					Map<String, List<T>> timedOutPattern = sharedBuffer.materializeMatch(extractCurrentMatches(
-						sharedBuffer,
-						computationState), eventsCache);
-					timeoutResult.add(Tuple2.of(timedOutPattern, timestamp));
-				}
-
-				sharedBuffer.releaseNode(computationState.getPreviousBufferEntry());
-
-				nfaState.setStateChanged();
-			} else {
-				newPartialMatches.add(computationState);
-			}
-		}
-
-		nfaState.setNewPartialMatches(newPartialMatches);
-
-		sharedBuffer.advanceTime(timestamp);
-
-		return timeoutResult;
-	}
-
-	private boolean isStateTimedOut(final ComputationState state, final long timestamp) {
-		return !isStartState(state) && windowTime > 0L && timestamp - state.getStartTimestamp() >= windowTime;
 	}
 
 	private Collection<Map<String, List<T>>> doProcess(
@@ -355,52 +288,6 @@ public class NFA<T> {
 		return result;
 	}
 
-	private void processMatchesAccordingToSkipStrategy(
-			SharedBuffer<T> sharedBuffer,
-			NFAState nfaState,
-			AfterMatchSkipStrategy afterMatchSkipStrategy,
-			PriorityQueue<ComputationState> potentialMatches,
-			PriorityQueue<ComputationState> partialMatches,
-			List<Map<String, List<T>>> result) throws Exception {
-
-		nfaState.getCompletedMatches().addAll(potentialMatches);
-
-		ComputationState earliestMatch = nfaState.getCompletedMatches().peek();
-
-		if (earliestMatch != null) {
-
-			Map<EventId, T> eventsCache = new HashMap<>();
-			ComputationState earliestPartialMatch;
-			while (earliestMatch != null && ((earliestPartialMatch = partialMatches.peek()) == null ||
-				isEarlier(earliestMatch, earliestPartialMatch))) {
-
-				nfaState.setStateChanged();
-				nfaState.getCompletedMatches().poll();
-				List<Map<String, List<EventId>>> matchedResult =
-					sharedBuffer.extractPatterns(earliestMatch.getPreviousBufferEntry(), earliestMatch.getVersion());
-
-				afterMatchSkipStrategy.prune(
-					partialMatches,
-					matchedResult,
-					sharedBuffer);
-
-				afterMatchSkipStrategy.prune(
-					nfaState.getCompletedMatches(),
-					matchedResult,
-					sharedBuffer);
-
-				result.add(sharedBuffer.materializeMatch(matchedResult.get(0), eventsCache));
-				earliestMatch = nfaState.getCompletedMatches().peek();
-			}
-
-			nfaState.getPartialMatches().removeIf(pm -> pm.getStartEventID() != null && !partialMatches.contains(pm));
-		}
-	}
-
-	private boolean isEarlier(ComputationState earliestMatch, ComputationState earliestPartialMatch) {
-		return NFAState.COMPUTATION_STATE_COMPARATOR.compare(earliestMatch, earliestPartialMatch) <= 0;
-	}
-
 	private static <T> boolean isEquivalentState(final State<T> s1, final State<T> s2) {
 		return s1.getName().equals(s2.getName());
 	}
@@ -466,10 +353,13 @@ public class NFA<T> {
 
 		private EventId eventId;
 
-		EventWrapper(T event, long timestamp, SharedBuffer<T> sharedBuffer) {
+		private int userId;
+
+		EventWrapper(T event, long timestamp, SharedBuffer<T> sharedBuffer, int userId) {
 			this.event = event;
 			this.timestamp = timestamp;
 			this.sharedBuffer = sharedBuffer;
+			this.userId = userId;
 		}
 
 		EventId getEventId() throws Exception {
@@ -486,6 +376,10 @@ public class NFA<T> {
 
 		public long getTimestamp() {
 			return timestamp;
+		}
+
+		public int getUserId() {
+			return userId;
 		}
 
 		@Override
@@ -775,7 +669,7 @@ public class NFA<T> {
 	/**
 	 * The context used when evaluating this computation state.
 	 */
-	private static class ConditionContext<T> implements IterativeCondition.Context<T> {
+	private static class ConditionContext<T extends UserEvent> implements IterativeCondition.Context<T> {
 
 		/** The current computation state. */
 		private ComputationState computationState;
@@ -821,200 +715,6 @@ public class NFA<T> {
 						: elements.iterator();
 				}
 			};
-		}
-	}
-
-	////////////////////				DEPRECATED/MIGRATION UTILS
-
-	/**
-	 * Wrapper for migrated state.
-	 */
-	public static class MigratedNFA<T> {
-
-		private final Queue<ComputationState> computationStates;
-		private final org.apache.flink.cep.nfa.SharedBuffer<T> sharedBuffer;
-
-		public org.apache.flink.cep.nfa.SharedBuffer<T> getSharedBuffer() {
-			return sharedBuffer;
-		}
-
-		public Queue<ComputationState> getComputationStates() {
-			return computationStates;
-		}
-
-		MigratedNFA(
-				final Queue<ComputationState> computationStates,
-				final org.apache.flink.cep.nfa.SharedBuffer<T> sharedBuffer) {
-			this.sharedBuffer = sharedBuffer;
-			this.computationStates = computationStates;
-		}
-	}
-
-	/**
-	 * The {@link TypeSerializerConfigSnapshot} serializer configuration to be stored with the managed state.
-	 */
-	@Deprecated
-	public static final class NFASerializerConfigSnapshot<T> extends CompositeTypeSerializerConfigSnapshot {
-
-		private static final int VERSION = 1;
-
-		/** This empty constructor is required for deserializing the configuration. */
-		public NFASerializerConfigSnapshot() {}
-
-		public NFASerializerConfigSnapshot(
-				TypeSerializer<T> eventSerializer,
-				TypeSerializer<org.apache.flink.cep.nfa.SharedBuffer<T>> sharedBufferSerializer) {
-
-			super(eventSerializer, sharedBufferSerializer);
-		}
-
-		@Override
-		public int getVersion() {
-			return VERSION;
-		}
-	}
-
-	/**
-	 * Only for backward compatibility with <=1.5.
-	 */
-	@Deprecated
-	public static class NFASerializer<T> extends TypeSerializer<MigratedNFA<T>> {
-
-		private static final long serialVersionUID = 2098282423980597010L;
-
-		private final TypeSerializer<org.apache.flink.cep.nfa.SharedBuffer<T>> sharedBufferSerializer;
-
-		private final TypeSerializer<T> eventSerializer;
-
-		public NFASerializer(TypeSerializer<T> typeSerializer) {
-			this(typeSerializer,
-				new org.apache.flink.cep.nfa.SharedBuffer.SharedBufferSerializer<>(
-					StringSerializer.INSTANCE,
-					typeSerializer));
-		}
-
-		NFASerializer(
-				TypeSerializer<T> typeSerializer,
-				TypeSerializer<org.apache.flink.cep.nfa.SharedBuffer<T>> sharedBufferSerializer) {
-			this.eventSerializer = typeSerializer;
-			this.sharedBufferSerializer = sharedBufferSerializer;
-		}
-
-		@Override
-		public boolean isImmutableType() {
-			return false;
-		}
-
-		@Override
-		public NFASerializer<T> duplicate() {
-			return new NFASerializer<>(eventSerializer.duplicate());
-		}
-
-		@Override
-		public MigratedNFA<T> createInstance() {
-			return null;
-		}
-
-		@Override
-		public MigratedNFA<T> copy(MigratedNFA<T> from) {
-			throw new UnsupportedOperationException();
-		}
-
-		@Override
-		public MigratedNFA<T> copy(MigratedNFA<T> from, MigratedNFA<T> reuse) {
-			return copy(from);
-		}
-
-		@Override
-		public int getLength() {
-			return -1;
-		}
-
-		@Override
-		public void serialize(MigratedNFA<T> record, DataOutputView target) {
-			throw new UnsupportedOperationException();
-		}
-
-		@Override
-		public MigratedNFA<T> deserialize(DataInputView source) throws IOException {
-			MigrationUtils.skipSerializedStates(source);
-			source.readLong();
-			source.readBoolean();
-
-			org.apache.flink.cep.nfa.SharedBuffer<T> sharedBuffer = sharedBufferSerializer.deserialize(source);
-			Queue<ComputationState> computationStates = deserializeComputationStates(sharedBuffer, eventSerializer, source);
-
-			return new MigratedNFA<>(computationStates, sharedBuffer);
-		}
-
-		@Override
-		public MigratedNFA<T> deserialize(
-				MigratedNFA<T> reuse,
-				DataInputView source) throws IOException {
-			return deserialize(source);
-		}
-
-		@Override
-		public void copy(DataInputView source, DataOutputView target) {
-			throw new UnsupportedOperationException();
-		}
-
-		@Override
-		public boolean equals(Object obj) {
-			return obj == this ||
-				(obj != null && obj.getClass().equals(getClass()) &&
-					sharedBufferSerializer.equals(((NFASerializer) obj).sharedBufferSerializer) &&
-					eventSerializer.equals(((NFASerializer) obj).eventSerializer));
-		}
-
-		@Override
-		public boolean canEqual(Object obj) {
-			return true;
-		}
-
-		@Override
-		public int hashCode() {
-			return 37 * sharedBufferSerializer.hashCode() + eventSerializer.hashCode();
-		}
-
-		@Override
-		public TypeSerializerConfigSnapshot snapshotConfiguration() {
-			return new NFASerializerConfigSnapshot<>(eventSerializer, sharedBufferSerializer);
-		}
-
-		@Override
-		public CompatibilityResult<MigratedNFA<T>> ensureCompatibility(TypeSerializerConfigSnapshot configSnapshot) {
-			if (configSnapshot instanceof NFASerializerConfigSnapshot) {
-				List<Tuple2<TypeSerializer<?>, TypeSerializerConfigSnapshot>> serializersAndConfigs =
-					((NFASerializerConfigSnapshot) configSnapshot).getNestedSerializersAndConfigs();
-
-				CompatibilityResult<T> eventCompatResult = CompatibilityUtil.resolveCompatibilityResult(
-					serializersAndConfigs.get(0).f0,
-					UnloadableDummyTypeSerializer.class,
-					serializersAndConfigs.get(0).f1,
-					eventSerializer);
-
-				CompatibilityResult<org.apache.flink.cep.nfa.SharedBuffer<T>> sharedBufCompatResult =
-					CompatibilityUtil.resolveCompatibilityResult(
-						serializersAndConfigs.get(1).f0,
-						UnloadableDummyTypeSerializer.class,
-						serializersAndConfigs.get(1).f1,
-						sharedBufferSerializer);
-
-				if (!sharedBufCompatResult.isRequiresMigration() && !eventCompatResult.isRequiresMigration()) {
-					return CompatibilityResult.compatible();
-				} else {
-					if (eventCompatResult.getConvertDeserializer() != null &&
-						sharedBufCompatResult.getConvertDeserializer() != null) {
-						return CompatibilityResult.requiresMigration(
-							new NFASerializer<>(
-								new TypeDeserializerAdapter<>(eventCompatResult.getConvertDeserializer()),
-								new TypeDeserializerAdapter<>(sharedBufCompatResult.getConvertDeserializer())));
-					}
-				}
-			}
-
-			return CompatibilityResult.requiresMigration();
 		}
 	}
 }

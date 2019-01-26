@@ -23,6 +23,7 @@ import org.apache.flink.api.common.typeutils.base.StringSerializer;
 import org.apache.flink.api.common.typeutils.base.TypeSerializerSingleton;
 import org.apache.flink.core.memory.DataInputView;
 import org.apache.flink.core.memory.DataOutputView;
+import org.roaringbitmap.RoaringBitmap;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -34,10 +35,12 @@ public class NodeId {
 
 	private final String pageName;
 	private final EventId eventId;
+	private final RoaringBitmap rbm;
 
-	public NodeId(EventId eventId, String pageName) {
+	public NodeId(EventId eventId, String pageName, RoaringBitmap rbm) {
 		this.eventId = eventId;
 		this.pageName = pageName;
+		this.rbm = rbm;
 	}
 
 	public EventId getEventId() {
@@ -46,6 +49,14 @@ public class NodeId {
 
 	public String getPageName() {
 		return pageName;
+	}
+
+	public RoaringBitmap getRbm() {
+		return rbm;
+	}
+
+	public void addUser(Integer userId) {
+		this.rbm.add(userId);
 	}
 
 	@Override
@@ -96,7 +107,7 @@ public class NodeId {
 
 		@Override
 		public NodeId copy(NodeId from) {
-			return new NodeId(from.eventId, from.pageName);
+			return new NodeId(from.eventId, from.pageName, from.rbm);
 		}
 
 		@Override
@@ -129,7 +140,9 @@ public class NodeId {
 
 			EventId eventId = EventId.EventIdSerializer.INSTANCE.deserialize(source);
 			String pageName = StringSerializer.INSTANCE.deserialize(source);
-			return new NodeId(eventId, pageName);
+			RoaringBitmap rbm = new RoaringBitmap();
+			rbm.deserialize(source);
+			return new NodeId(eventId, pageName, rbm);
 		}
 
 		@Override
