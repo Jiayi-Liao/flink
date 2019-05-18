@@ -37,6 +37,7 @@ under the License.
 	<modules>
 		<module>flink-queryable-state-runtime</module>
 		<module>flink-queryable-state-client-java</module>
+		<module>flink-queryable-state-offline-client</module>
 		<!-- <module>flink-state-client-scala</module>-->
 	</modules>
 
