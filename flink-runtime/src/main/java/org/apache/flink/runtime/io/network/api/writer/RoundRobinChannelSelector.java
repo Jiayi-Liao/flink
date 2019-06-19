@@ -27,7 +27,8 @@ import org.apache.flink.core.io.IOReadableWritable;
  * @param <T>
  *        the type of record which is sent through the attached output gate
  */
-public class RoundRobinChannelSelector<T extends IOReadableWritable> implements ChannelSelector<T> {
+public class RoundRobinChannelSelector<T extends IOReadableWritable>
+	implements ChannelSelector<T>, BacklogBasedSelector {
 
 	/**
 	 * Stores the index of the channel to send the next record to.

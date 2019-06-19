@@ -27,6 +27,7 @@ import org.apache.flink.runtime.io.network.api.serialization.RecordSerializer;
 import org.apache.flink.runtime.io.network.api.serialization.SpanningRecordSerializer;
 import org.apache.flink.runtime.io.network.buffer.BufferBuilder;
 import org.apache.flink.runtime.io.network.buffer.BufferConsumer;
+import org.apache.flink.runtime.io.network.partition.ResultPartition;
 import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 import org.apache.flink.util.XORShiftRandom;
 
@@ -125,7 +126,13 @@ public class RecordWriter<T extends IOReadableWritable> {
 		sendToTarget(record, rng.nextInt(numChannels));
 	}
 
-	private void sendToTarget(T record, int targetChannel) throws IOException, InterruptedException {
+	private void sendToTarget(T record, int targetCandidateChannel) throws IOException, InterruptedException {
+		int targetChannel = targetCandidateChannel;
+
+		if (targetPartition instanceof ResultPartition && channelSelector instanceof BacklogBasedSelector) {
+			targetChannel = ((ResultPartition) targetPartition).changIfBlockingChannel(targetChannel);
+		}
+
 		RecordSerializer<T> serializer = serializers[targetChannel];
 
 		SerializationResult result = serializer.addRecord(record);

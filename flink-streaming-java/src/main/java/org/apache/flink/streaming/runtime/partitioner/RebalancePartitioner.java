@@ -18,6 +18,7 @@
 package org.apache.flink.streaming.runtime.partitioner;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.runtime.io.network.api.writer.BacklogBasedSelector;
 import org.apache.flink.runtime.plugable.SerializationDelegate;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
@@ -28,7 +29,7 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
  * @param <T> Type of the elements in the Stream being rebalanced
  */
 @Internal
-public class RebalancePartitioner<T> extends StreamPartitioner<T> {
+public class RebalancePartitioner<T> extends StreamPartitioner<T> implements BacklogBasedSelector {
 	private static final long serialVersionUID = 1L;
 
 	private final int[] returnArray = new int[] {-1};

@@ -19,6 +19,7 @@
 package org.apache.flink.runtime.io.network.partition;
 
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
@@ -37,6 +38,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.NavigableMap;
+import java.util.PriorityQueue;
+import java.util.SortedMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -237,6 +241,17 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 	}
 
 	// ------------------------------------------------------------------------
+
+	public int changIfBlockingChannel(int subpartitionIndex) {
+		int bufferSize = bufferPool.getNumBuffers();
+		int backlogSize = subpartitions[subpartitionIndex].getBuffersInBacklog();
+		if (backlogSize >= bufferSize / 2) {
+			// change subpartition to send
+			return (subpartitionIndex + 1) % subpartitions.length;
+		} else {
+			return subpartitionIndex;
+		}
+	}
 
 	@Override
 	public void addBufferConsumer(BufferConsumer bufferConsumer, int subpartitionIndex) throws IOException {
