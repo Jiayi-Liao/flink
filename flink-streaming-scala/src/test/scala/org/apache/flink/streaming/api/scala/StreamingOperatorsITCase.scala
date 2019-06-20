@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.api.scala
 
 import org.apache.flink.api.common.functions.{FoldFunction, RichMapFunction}
+import org.apache.flink.configuration.Configuration
 import org.apache.flink.core.fs.FileSystem
 import org.apache.flink.streaming.api.functions.source.SourceFunction
 import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceContext
@@ -52,6 +53,50 @@ class StreamingOperatorsITCase extends AbstractTestBase {
   def after(): Unit = {
     TestBaseUtils.compareResultsByLinesInMemory(expected1, resultPath1)
     TestBaseUtils.compareResultsByLinesInMemory(expected2, resultPath2)
+  }
+
+  @Test
+  def testRebalance(): Unit = {
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+
+    env.setParallelism(2)
+    env.getConfig.setMaxParallelism(2)
+
+    val sourceStream = env.addSource(new SourceFunction[(Int, Int)] {
+
+      override def run(ctx: SourceContext[(Int, Int)]): Unit = {
+        while (true) {
+          0 until 10 foreach {
+            // keys '1' and '2' hash to different buckets
+            i => ctx.collect((1 + MathUtils.murmurHash(i) % 5, i))
+          }
+        }
+      }
+
+      override def cancel(): Unit = {}
+    })
+
+    sourceStream.rebalance.map(new RichMapFunction[(Int, Int), String] {
+
+      var block = false
+
+      override def open(parameters: Configuration): Unit = {
+        super.open(parameters)
+        if (getRuntimeContext.getIndexOfThisSubtask == 0) {
+          block = true
+        }
+      }
+
+      override def map(value: (Int, Int)): String = {
+        if (block) {
+          Thread.sleep(10000)
+        }
+        s"Subtask Index: ${getRuntimeContext.getIndexOfThisSubtask}"
+      }
+    }).print()
+
+    println(env.getExecutionPlan)
+    env.execute()
   }
 
   /** Tests the streaming fold operation. For this purpose a stream of Tuple[Int, Int] is created.
