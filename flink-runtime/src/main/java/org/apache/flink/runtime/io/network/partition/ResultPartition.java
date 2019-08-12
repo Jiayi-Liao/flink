@@ -242,7 +242,7 @@ public class ResultPartition implements ResultPartitionWriter, BufferPoolOwner {
 
 	// ------------------------------------------------------------------------
 
-	public int changIfBlockingChannel(int subpartitionIndex) {
+	public int changeIfBlockingChannel(int subpartitionIndex) {
 		int bufferSize = bufferPool.getNumBuffers();
 		int backlogSize = subpartitions[subpartitionIndex].getBuffersInBacklog();
 		if (backlogSize >= bufferSize / 2) {

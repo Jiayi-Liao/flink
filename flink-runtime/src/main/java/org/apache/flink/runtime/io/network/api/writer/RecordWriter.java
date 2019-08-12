@@ -130,7 +130,7 @@ public class RecordWriter<T extends IOReadableWritable> {
 		int targetChannel = targetCandidateChannel;
 
 		if (targetPartition instanceof ResultPartition && channelSelector instanceof BacklogBasedSelector) {
-			targetChannel = ((ResultPartition) targetPartition).changIfBlockingChannel(targetChannel);
+			targetChannel = ((ResultPartition) targetPartition).changeIfBlockingChannel(targetChannel);
 		}
 
 		RecordSerializer<T> serializer = serializers[targetChannel];
