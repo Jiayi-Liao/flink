@@ -22,11 +22,13 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.util.ExceptionUtils;
 
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.common.TopicPartition;
 
 import javax.annotation.Nonnull;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.Closeable;
+import java.util.List;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -54,6 +56,9 @@ public final class Handover implements Closeable {
 	private ConsumerRecords<byte[], byte[]> next;
 	private Throwable error;
 	private boolean wakeupProducer;
+
+	private List<KafkaTopicPartitionState<TopicPartition>> partitions;
+	private volatile long version;
 
 	/**
 	 * Polls the next element from the Handover, possibly blocking until the next element is
@@ -133,6 +138,10 @@ public final class Handover implements Closeable {
 				throw new ClosedException();
 			}
 		}
+	}
+
+	public void updateProducePartitions() {
+
 	}
 
 	/**

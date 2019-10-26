@@ -14,7 +14,7 @@ import static org.apache.flink.streaming.connectors.kafka.internals.AbstractFetc
 import static org.apache.flink.streaming.connectors.kafka.internals.AbstractFetcher.PERIODIC_WATERMARKS;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
-public abstract class RecordEmitter<T, KPH> {
+public abstract class Emitter<T, KPH> {
 
     private final Object checkpointLock;
 
@@ -26,7 +26,7 @@ public abstract class RecordEmitter<T, KPH> {
 
     private final List<KafkaTopicPartitionState<KPH>> subscribedPartitionStates;
 
-    public RecordEmitter(
+    public Emitter(
             ProcessingTimeService processingTimeProvider,
             SourceFunction.SourceContext<T> sourceContext,
             List<KafkaTopicPartitionState<KPH>> subscribedPartitionStates,

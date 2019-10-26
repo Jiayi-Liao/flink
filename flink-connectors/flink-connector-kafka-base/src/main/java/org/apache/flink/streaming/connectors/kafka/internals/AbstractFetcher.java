@@ -24,7 +24,7 @@ import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
 import org.apache.flink.streaming.api.functions.source.SourceFunction.SourceContext;
-import org.apache.flink.streaming.connectors.kafka.RecordEmitter;
+import org.apache.flink.streaming.connectors.kafka.Emitter;
 import org.apache.flink.streaming.connectors.kafka.TimestampAsyncRecordEmitter;
 import org.apache.flink.streaming.connectors.kafka.TimestampSyncRecordEmitter;
 import org.apache.flink.streaming.connectors.kafka.config.OffsetCommitMode;
@@ -133,7 +133,7 @@ public abstract class AbstractFetcher<T, KPH> {
 	@Deprecated
 	private final MetricGroup legacyCommittedOffsetsMetricGroup;
 
-	private final RecordEmitter<T, KPH> recordEmitter;
+	private final Emitter<T, KPH> recordEmitter;
 
 	protected AbstractFetcher(
 			SourceContext<T> sourceContext,
@@ -196,10 +196,10 @@ public abstract class AbstractFetcher<T, KPH> {
 		}
 
 		if (timestampWatermarkMode == NO_TIMESTAMPS_WATERMARKS) {
-			this.recordEmitter = new TimestampAsyncRecordEmitter<>(processingTimeProvider, sourceContext, subscribedPartitionStates,
+			this.recordEmitter = new TimestampAsyncEmitter<>(processingTimeProvider, sourceContext, subscribedPartitionStates,
 					autoWatermarkInterval, timestampWatermarkMode);
 		} else {
-			this.recordEmitter = new TimestampSyncRecordEmitter<>(processingTimeProvider, sourceContext, subscribedPartitionStates,
+			this.recordEmitter = new TimestampSyncEmitter<>(processingTimeProvider, sourceContext, subscribedPartitionStates,
 					autoWatermarkInterval, timestampWatermarkMode);
 		}
 
