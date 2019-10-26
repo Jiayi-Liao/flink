@@ -1,15 +1,59 @@
 package org.apache.flink.streaming.connectors.kafka;
 
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionState;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionStateWithPeriodicWatermarks;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionStateWithPunctuatedWatermarks;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeCallback;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 
-public class RecordEmitter<T, KPH> {
+import java.util.List;
+
+import static org.apache.flink.streaming.connectors.kafka.internals.AbstractFetcher.NO_TIMESTAMPS_WATERMARKS;
+import static org.apache.flink.streaming.connectors.kafka.internals.AbstractFetcher.PERIODIC_WATERMARKS;
+import static org.apache.flink.util.Preconditions.checkNotNull;
+
+public abstract class RecordEmitter<T, KPH> {
+
+    private final Object checkpointLock;
+
+    private final int timestampWatermarkMode;
+
+    private volatile long maxWatermarkSoFar = Long.MIN_VALUE;
+
+    private final SourceFunction.SourceContext<T> sourceContext;
+
+    private final List<KafkaTopicPartitionState<KPH>> subscribedPartitionStates;
+
+    public RecordEmitter(
+            ProcessingTimeService processingTimeProvider,
+            SourceFunction.SourceContext<T> sourceContext,
+            List<KafkaTopicPartitionState<KPH>> subscribedPartitionStates,
+            long autoWatermarkInterval,
+            int timestampWatermarkMode) {
+        this.sourceContext = sourceContext;
+        this.checkpointLock = sourceContext.getCheckpointLock();
+        this.timestampWatermarkMode = timestampWatermarkMode;
+        this.subscribedPartitionStates = subscribedPartitionStates;
+        // if we have periodic watermarks, kick off the interval scheduler
+        if (timestampWatermarkMode == PERIODIC_WATERMARKS) {
+            @SuppressWarnings("unchecked")
+            PeriodicWatermarkEmitter periodicEmitter = new PeriodicWatermarkEmitter(
+                    subscribedPartitionStates,
+                    sourceContext,
+                    processingTimeProvider,
+                    autoWatermarkInterval);
+
+            periodicEmitter.start();
+        }
+    }
 
     // ------------------------------------------------------------------------
     //  emitting records
     // ------------------------------------------------------------------------
+
+    public abstract void putRecord(T record, KafkaTopicPartitionState<KPH> partitionState, long offset) throws Exception;
 
     /**
      * Emits a record without attaching an existing timestamp to it.
@@ -22,7 +66,6 @@ public class RecordEmitter<T, KPH> {
      * @param offset The offset of the record
      */
     protected void emitRecord(T record, KafkaTopicPartitionState<KPH> partitionState, long offset) throws Exception {
-
         if (record != null) {
             if (timestampWatermarkMode == NO_TIMESTAMPS_WATERMARKS) {
                 // fast path logic, in case there are no watermarks
@@ -137,5 +180,96 @@ public class RecordEmitter<T, KPH> {
             updateMinPunctuatedWatermark(newWatermark);
         }
     }
+    /**
+     * Checks whether a new per-partition watermark is also a new cross-partition watermark.
+     */
+    private void updateMinPunctuatedWatermark(Watermark nextWatermark) {
+        if (nextWatermark.getTimestamp() > maxWatermarkSoFar) {
+            long newMin = Long.MAX_VALUE;
 
+            for (KafkaTopicPartitionState<?> state : subscribedPartitionStates) {
+                @SuppressWarnings("unchecked")
+                final KafkaTopicPartitionStateWithPunctuatedWatermarks<T, KPH> withWatermarksState =
+                        (KafkaTopicPartitionStateWithPunctuatedWatermarks<T, KPH>) state;
+
+                newMin = Math.min(newMin, withWatermarksState.getCurrentPartitionWatermark());
+            }
+
+            // double-check locking pattern
+            if (newMin > maxWatermarkSoFar) {
+                synchronized (checkpointLock) {
+                    if (newMin > maxWatermarkSoFar) {
+                        maxWatermarkSoFar = newMin;
+                        sourceContext.emitWatermark(new Watermark(newMin));
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The periodic watermark emitter. In its given interval, it checks all partitions for
+     * the current event time watermark, and possibly emits the next watermark.
+     */
+    private static class PeriodicWatermarkEmitter<KPH> implements ProcessingTimeCallback {
+
+        private final List<KafkaTopicPartitionState<KPH>> allPartitions;
+
+        private final SourceFunction.SourceContext<?> emitter;
+
+        private final ProcessingTimeService timerService;
+
+        private final long interval;
+
+        private long lastWatermarkTimestamp;
+
+        //-------------------------------------------------
+
+        PeriodicWatermarkEmitter(
+                List<KafkaTopicPartitionState<KPH>> allPartitions,
+                SourceFunction.SourceContext<?> emitter,
+                ProcessingTimeService timerService,
+                long autoWatermarkInterval) {
+            this.allPartitions = checkNotNull(allPartitions);
+            this.emitter = checkNotNull(emitter);
+            this.timerService = checkNotNull(timerService);
+            this.interval = autoWatermarkInterval;
+            this.lastWatermarkTimestamp = Long.MIN_VALUE;
+        }
+
+        //-------------------------------------------------
+
+        public void start() {
+            timerService.registerTimer(timerService.getCurrentProcessingTime() + interval, this);
+        }
+
+        @Override
+        public void onProcessingTime(long timestamp) throws Exception {
+
+            long minAcrossAll = Long.MAX_VALUE;
+            boolean isEffectiveMinAggregation = false;
+            for (KafkaTopicPartitionState<?> state : allPartitions) {
+
+                // we access the current watermark for the periodic assigners under the state
+                // lock, to prevent concurrent modification to any internal variables
+                final long curr;
+                //noinspection SynchronizationOnLocalVariableOrMethodParameter
+                synchronized (state) {
+                    curr = ((KafkaTopicPartitionStateWithPeriodicWatermarks<?, ?>) state).getCurrentWatermarkTimestamp();
+                }
+
+                minAcrossAll = Math.min(minAcrossAll, curr);
+                isEffectiveMinAggregation = true;
+            }
+
+            // emit next watermark, if there is one
+            if (isEffectiveMinAggregation && minAcrossAll > lastWatermarkTimestamp) {
+                lastWatermarkTimestamp = minAcrossAll;
+                emitter.emitWatermark(new Watermark(minAcrossAll));
+            }
+
+            // schedule the next watermark
+            timerService.registerTimer(timerService.getCurrentProcessingTime() + interval, this);
+        }
+    }
 }
