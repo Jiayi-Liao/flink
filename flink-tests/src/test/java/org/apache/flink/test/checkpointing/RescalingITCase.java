@@ -96,7 +96,7 @@ public class RescalingITCase extends TestLogger {
 
 	@Parameterized.Parameters(name = "backend = {0}")
 	public static Object[] data() {
-		return new Object[]{"filesystem", "rocksdb"};
+		return new Object[]{"filesystem"};
 	}
 
 	@Parameterized.Parameter
@@ -154,18 +154,64 @@ public class RescalingITCase extends TestLogger {
 	}
 
 	@Test
-	public void testSavepointRescalingOutKeyedState() throws Exception {
-		testSavepointRescalingKeyedState(true, false);
+	public void testRecover() throws Exception {
+		testRecoverFromExistingSavepoint();
 	}
 
-	@Test
-	public void testSavepointRescalingInKeyedStateDerivedMaxParallelism() throws Exception {
-		testSavepointRescalingKeyedState(false, true);
-	}
+//	@Test
+//	public void testSavepointRescalingOutKeyedState() throws Exception {
+//		testSavepointRescalingKeyedState(true, false);
+//	}
+//
+//	@Test
+//	public void testSavepointRescalingInKeyedStateDerivedMaxParallelism() throws Exception {
+//		testSavepointRescalingKeyedState(false, true);
+//	}
+//
+//	@Test
+//	public void testSavepointRescalingOutKeyedStateDerivedMaxParallelism() throws Exception {
+//		testSavepointRescalingKeyedState(true, true);
+//	}
 
-	@Test
-	public void testSavepointRescalingOutKeyedStateDerivedMaxParallelism() throws Exception {
-		testSavepointRescalingKeyedState(true, true);
+	public void testRecoverFromExistingSavepoint() throws Exception {
+		final String savepointPath = "/Users/liaojiayi/checkpoint/savepoint-e52fdf-d6995924a8ba";
+		final int numberKeys = 42;
+		final int numberElements = 1000;
+		final int numberElements2 = 500;
+		final int parallelism = numSlots;
+		final int parallelism2 = numSlots / 2;
+		final int maxParallelism = 13;
+
+		Duration timeout = Duration.ofMinutes(3);
+		Deadline deadline = Deadline.now().plus(timeout);
+
+		ClusterClient<?> client = cluster.getClusterClient();
+
+		try {
+			int restoreMaxParallelism = maxParallelism;
+
+			JobGraph scaledJobGraph = createJobGraphWithKeyedState(parallelism2, restoreMaxParallelism, numberKeys, numberElements2, true, 100);
+
+			scaledJobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+
+			ClientUtils.submitJobAndWaitForResult(client, scaledJobGraph, RescalingITCase.class.getClassLoader());
+
+			Set<Tuple2<Integer, Integer>> actualResult2 = CollectionSink.getElementsSet();
+
+			Set<Tuple2<Integer, Integer>> expectedResult2 = new HashSet<>();
+
+			for (int key = 0; key < numberKeys; key++) {
+				int keyGroupIndex = KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism);
+				expectedResult2.add(Tuple2.of(KeyGroupRangeAssignment.computeOperatorIndexForKeyGroup(maxParallelism, parallelism2, keyGroupIndex), key * (numberElements + numberElements2)));
+			}
+
+			assertEquals(expectedResult2, actualResult2);
+
+		} finally {
+			// clear the CollectionSink set for the restarted job
+			CollectionSink.clearElementsSet();
+		}
+
 	}
 
 	/**
@@ -212,9 +258,11 @@ public class RescalingITCase extends TestLogger {
 			// clear the CollectionSink set for the restarted job
 			CollectionSink.clearElementsSet();
 
-			CompletableFuture<String> savepointPathFuture = client.triggerSavepoint(jobID, null);
+			CompletableFuture<String> savepointPathFuture = client.triggerSavepoint(jobID, "/Users/liaojiayi/checkpoint/");
 
 			final String savepointPath = savepointPathFuture.get(deadline.timeLeft().toMillis(), TimeUnit.MILLISECONDS);
+
+			System.out.println(savepointPath);
 
 			client.cancel(jobID).get();
 
@@ -722,6 +770,7 @@ public class RescalingITCase extends TestLogger {
 
 		private transient ValueState<Integer> counter;
 		private transient ValueState<Integer> sum;
+		private transient ListState<Integer> list;
 
 		private final int numberElements;
 
@@ -731,6 +780,7 @@ public class RescalingITCase extends TestLogger {
 
 		@Override
 		public void flatMap(Integer value, Collector<Tuple2<Integer, Integer>> out) throws Exception {
+			list.add(1234);
 
 			int count = counter.value() + 1;
 			counter.update(count);
@@ -753,6 +803,7 @@ public class RescalingITCase extends TestLogger {
 		public void initializeState(FunctionInitializationContext context) throws Exception {
 			counter = context.getKeyedStateStore().getState(new ValueStateDescriptor<>("counter", Integer.class, 0));
 			sum = context.getKeyedStateStore().getState(new ValueStateDescriptor<>("sum", Integer.class, 0));
+			list = context.getKeyedStateStore().getListState(new ListStateDescriptor<>("list", Integer.class));
 		}
 	}
 

@@ -130,7 +130,13 @@ public final class ListSerializer<T> extends TypeSerializer<List<T>> {
 		// create new list with (size + 1) capacity to prevent expensive growth when a single element is added
 		final List<T> list = new ArrayList<>(size + 1);
 		for (int i = 0; i < size; i++) {
-			list.add(elementSerializer.deserialize(source));
+//			list.add(elementSerializer.deserialize(source));
+			boolean isNull = source.readBoolean();
+			if (isNull) {
+				list.add(null);
+			} else {
+				list.add(elementSerializer.deserialize(source));
+			}
 		}
 		return list;
 	}
